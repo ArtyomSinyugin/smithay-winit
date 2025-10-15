@@ -1,0 +1,590 @@
+use smithay_client_toolkit::{
+    reexports::client::{
+        Connection, Proxy, QueueHandle,
+        protocol::{wl_keyboard::WlKeyboard, wl_surface::WlSurface},
+    },
+    seat::keyboard::{
+        KeyEvent, KeyboardHandler, Keysym, Modifiers as WaylandModifiers, RawModifiers,
+    },
+};
+use tracing::error;
+use ui_events::keyboard::{Code, Key, KeyState, KeyboardEvent, Location, Modifiers, NamedKey};
+
+use crate::{Events, WaylandState};
+
+impl KeyboardHandler for WaylandState {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        surface: &WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+        let id = surface.id();
+        if self.windows.get_mut_by_object_id(&id).is_some() {
+            if let Err(err) = self.event_sender.send(Events::Focus(id.clone(), true)) {
+                error!("{err}");
+            }
+            self.seat_state.keyboard_focus = Some(id);
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        surface: &WlSurface,
+        _serial: u32,
+    ) {
+        let id = surface.id();
+        if let Err(err) = self.event_sender.send(Events::Focus(id, false)) {
+            error!("{err}");
+        }
+        self.seat_state.keyboard_focus = None;
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        let kb_event = self.translate_event(event, KeyState::Down, false);
+        self.events.push_back(Events::Keyboard(kb_event));
+    }
+
+    fn repeat_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        let kb_event = self.translate_event(event, KeyState::Down, true);
+        self.events.push_back(Events::Keyboard(kb_event));
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        let kb_event = self.translate_event(event, KeyState::Up, false);
+        self.events.push_back(Events::Keyboard(kb_event));
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        _modifiers: WaylandModifiers,
+        raw_modifiers: RawModifiers,
+        _layout: u32,
+    ) {
+        let combined = raw_modifiers.depressed | raw_modifiers.latched | raw_modifiers.locked;
+        self.seat_state.modifiers = Modifiers::from_bits_truncate(combined);
+    }
+}
+
+impl WaylandState {
+    fn translate_event(&self, event: KeyEvent, state: KeyState, repeat: bool) -> KeyboardEvent {
+        let key = if let Some(key) = event.utf8 {
+            Key::Character(key)
+        } else {
+            Key::Named(from_wayland_key(event.keysym))
+        };
+
+        let code = from_wayland_code(event.raw_code);
+
+        // === Location (для дублирующихся клавиш) ===
+        let location = match code {
+            Code::ShiftLeft | Code::ControlLeft | Code::AltLeft | Code::MetaLeft => Location::Left,
+            Code::ShiftRight | Code::ControlRight | Code::AltRight | Code::MetaRight => {
+                Location::Right
+            }
+            _ => Location::Standard,
+        };
+
+        KeyboardEvent {
+            state,
+            key,
+            code,
+            location,
+            modifiers: self.seat_state.modifiers,
+            repeat,
+            is_composing: false,
+        }
+    }
+}
+
+#[inline(always)]
+fn from_wayland_key(keysym: Keysym) -> NamedKey {
+    match keysym {
+        Keysym::Alt_L | Keysym::Alt_R => NamedKey::Alt,
+        Keysym::ISO_Level3_Shift | Keysym::SUN_AltGraph => NamedKey::AltGraph,
+        Keysym::Caps_Lock => NamedKey::CapsLock,
+        Keysym::Control_L | Keysym::Control_R => NamedKey::Control,
+        Keysym::XF86_Fn => NamedKey::Fn,
+        Keysym::Num_Lock => NamedKey::NumLock,
+        Keysym::Scroll_Lock => NamedKey::ScrollLock,
+        Keysym::Shift_L | Keysym::Shift_R => NamedKey::Shift,
+        Keysym::Meta_L | Keysym::Meta_R => NamedKey::Meta,
+        Keysym::Return | Keysym::ISO_Enter => NamedKey::Enter,
+        Keysym::KP_Enter => NamedKey::Enter,
+        Keysym::Tab => NamedKey::Tab,
+
+        Keysym::Down => NamedKey::ArrowDown,
+        Keysym::Left => NamedKey::ArrowLeft,
+        Keysym::Right => NamedKey::ArrowRight,
+        Keysym::Up => NamedKey::ArrowUp,
+
+        Keysym::End => NamedKey::End,
+        Keysym::Home => NamedKey::Home,
+        Keysym::Page_Down => NamedKey::PageDown,
+        Keysym::Page_Up => NamedKey::PageUp,
+
+        Keysym::BackSpace => NamedKey::Backspace,
+        Keysym::Clear | Keysym::XF86_Clear => NamedKey::Clear,
+        Keysym::XF86_Copy | Keysym::SUN_Copy => NamedKey::Copy,
+        Keysym::XF86_Cut | Keysym::SUN_Cut => NamedKey::Cut,
+        Keysym::Delete => NamedKey::Delete,
+        Keysym::Insert => NamedKey::Insert,
+        Keysym::XF86_Paste | Keysym::SUN_Paste => NamedKey::Paste,
+        Keysym::Redo => NamedKey::Redo,
+        Keysym::Undo => NamedKey::Undo,
+        // Keysym::SUN_Again => NamedKey::Again,
+        Keysym::_3270_Attn => NamedKey::Attn,
+        Keysym::Cancel => NamedKey::Cancel,
+        Keysym::XF86_ContextMenu => NamedKey::ContextMenu,
+        Keysym::Escape => NamedKey::Escape,
+        Keysym::Execute => NamedKey::Execute,
+        Keysym::Find => NamedKey::Find,
+        Keysym::Help => NamedKey::Help,
+        Keysym::Pause => NamedKey::Pause,
+        Keysym::_3270_Play => NamedKey::Play,
+        Keysym::SUN_Props => NamedKey::Props,
+        Keysym::Select | Keysym::XF86_Select => NamedKey::Select,
+
+        Keysym::XF86_ZoomIn => NamedKey::ZoomIn,
+        Keysym::XF86_ZoomOut => NamedKey::ZoomOut,
+        Keysym::XF86_MonBrightnessDown => NamedKey::BrightnessDown,
+        Keysym::XF86_MonBrightnessUp => NamedKey::BrightnessUp,
+        Keysym::XF86_Eject => NamedKey::Eject,
+        Keysym::XF86_LogOff => NamedKey::LogOff,
+
+        Keysym::XF86_PowerOff | Keysym::SUN_PowerSwitch => NamedKey::Power,
+
+        Keysym::Print => NamedKey::PrintScreen,
+        Keysym::XF86_Hibernate => NamedKey::Hibernate,
+        Keysym::XF86_Sleep | Keysym::XF86_Standby => NamedKey::Standby,
+        Keysym::XF86_WakeUp => NamedKey::WakeUp,
+
+        Keysym::Codeinput => NamedKey::CodeInput,
+        Keysym::Multi_key => NamedKey::Compose,
+        Keysym::Henkan => NamedKey::Convert,
+
+        Keysym::ISO_First_Group => NamedKey::GroupFirst,
+        Keysym::ISO_Last_Group => NamedKey::GroupLast,
+        Keysym::ISO_Next_Group => NamedKey::GroupNext,
+        Keysym::ISO_Prev_Group => NamedKey::GroupPrevious,
+        // Keysym::Mode_switch => NamedKey::ModeChange,
+        Keysym::Muhenkan => NamedKey::NonConvert,
+        Keysym::PreviousCandidate => NamedKey::PreviousCandidate,
+        Keysym::SingleCandidate => NamedKey::SingleCandidate,
+
+        Keysym::Eisu_toggle => NamedKey::Eisu,
+        Keysym::Hankaku => NamedKey::Hankaku,
+        Keysym::Hiragana => NamedKey::Hiragana,
+        Keysym::Hiragana_Katakana => NamedKey::HiraganaKatakana,
+        Keysym::Kana_Lock => NamedKey::KanaMode,
+        Keysym::Kanji => NamedKey::KanjiMode,
+        Keysym::Katakana => NamedKey::Katakana,
+        Keysym::Romaji => NamedKey::Romaji,
+        Keysym::Zenkaku => NamedKey::Zenkaku,
+        Keysym::Zenkaku_Hankaku => NamedKey::ZenkakuHankaku,
+
+        Keysym::XF86_ChannelDown => NamedKey::ChannelDown,
+        Keysym::XF86_ChannelUp => NamedKey::ChannelUp,
+        Keysym::XF86_Close => NamedKey::Close,
+        Keysym::XF86_MailForward => NamedKey::MailForward,
+        Keysym::XF86_Reply => NamedKey::MailReply,
+        Keysym::XF86_Send => NamedKey::MailSend,
+
+        Keysym::XF86_AudioForward | Keysym::XF86_AudioNext => NamedKey::MediaFastForward,
+        Keysym::XF86_AudioPause => NamedKey::MediaPause,
+        Keysym::XF86_AudioPlay => NamedKey::MediaPlay,
+        Keysym::XF86_AudioRecord => NamedKey::MediaRecord,
+        Keysym::XF86_AudioRewind | Keysym::XF86_AudioPrev => NamedKey::MediaRewind,
+        Keysym::XF86_AudioStop => NamedKey::MediaStop,
+        // Keysym::XF86_AudioNext => NamedKey::MediaTrackNext,
+        // Keysym::XF86_AudioPrev => NamedKey::MediaTrackPrevious,
+        Keysym::XF86_New => NamedKey::New,
+        Keysym::XF86_Open | Keysym::SUN_Open => NamedKey::Open,
+        Keysym::XF86_Save => NamedKey::Save,
+        Keysym::XF86_SpellCheck | Keysym::XF86_Spell => NamedKey::SpellCheck,
+
+        Keysym::XF86_AudioLowerVolume | Keysym::SUN_AudioLowerVolume => NamedKey::AudioVolumeDown,
+        Keysym::XF86_AudioRaiseVolume | Keysym::SUN_AudioRaiseVolume => NamedKey::AudioVolumeUp,
+        Keysym::XF86_AudioMute | Keysym::SUN_AudioMute => NamedKey::AudioVolumeMute,
+        Keysym::XF86_AudioMicMute => NamedKey::MicrophoneToggle, // выбрал один вариант
+
+        Keysym::XF86_Launch1 => NamedKey::LaunchApplication1,
+        Keysym::XF86_Launch2 => NamedKey::LaunchApplication2,
+        Keysym::XF86_Calendar => NamedKey::LaunchCalendar,
+        Keysym::XF86_Addressbook => NamedKey::LaunchContacts,
+        Keysym::XF86_Mail => NamedKey::LaunchMail,
+        Keysym::XF86_AudioMedia => NamedKey::LaunchMediaPlayer,
+        Keysym::XF86_Music => NamedKey::LaunchMusicPlayer,
+        Keysym::XF86_Phone => NamedKey::LaunchPhone,
+        Keysym::XF86_ScreenSaver => NamedKey::LaunchScreenSaver,
+        Keysym::XF86_Excel => NamedKey::LaunchSpreadsheet,
+        Keysym::XF86_WWW => NamedKey::LaunchWebBrowser,
+        Keysym::XF86_WebCam => NamedKey::LaunchWebCam,
+        Keysym::XF86_Word => NamedKey::LaunchWordProcessor,
+
+        Keysym::XF86_Back => NamedKey::BrowserBack,
+        Keysym::XF86_Favorites => NamedKey::BrowserFavorites,
+        Keysym::XF86_Forward => NamedKey::BrowserForward,
+        Keysym::XF86_HomePage => NamedKey::BrowserHome,
+        Keysym::XF86_Refresh => NamedKey::BrowserRefresh,
+        Keysym::XF86_Search => NamedKey::BrowserSearch,
+        Keysym::XF86_Stop => NamedKey::BrowserStop,
+
+        Keysym::XF86_AppSelect => NamedKey::AppSwitch,
+        Keysym::XF86_CameraFocus => NamedKey::CameraFocus,
+        Keysym::XF86_HangupPhone => NamedKey::EndCall,
+
+        Keysym::XF86_NotificationCenter => NamedKey::Notification,
+
+        Keysym::XF86_Video => NamedKey::TV,
+        Keysym::XF86_3DMode => NamedKey::TV3DMode,
+        Keysym::XF86_AudioDesc => NamedKey::TVAudioDescription,
+        Keysym::XF86_TopMenu => NamedKey::TVContentsMenu,
+        Keysym::XF86_Data => NamedKey::TVDataService,
+        Keysym::XF86_Red => NamedKey::ColorF0Red,
+        Keysym::XF86_Green => NamedKey::ColorF1Green,
+        Keysym::XF86_Yellow => NamedKey::ColorF2Yellow,
+        Keysym::XF86_Blue => NamedKey::ColorF3Blue,
+
+        Keysym::XF86_DisplayToggle => NamedKey::DisplaySwap,
+        Keysym::XF86_Info => NamedKey::Info,
+        Keysym::XF86_AudioCycleTrack => NamedKey::MediaAudioTrack,
+        // Keysym::XF86_AudioRewind => NamedKey::MediaSkipBackward,
+        // Keysym::XF86_AudioForward => NamedKey::MediaSkipForward,
+        Keysym::XF86_FrameBack => NamedKey::MediaStepBackward,
+        Keysym::XF86_FrameForward => NamedKey::MediaStepForward,
+        Keysym::XF86_MediaTopMenu => NamedKey::MediaTopMenu,
+
+        Keysym::XF86_NextFavorite => NamedKey::NextFavoriteChannel,
+        Keysym::XF86_VOD => NamedKey::OnDemand,
+        Keysym::XF86_SlowReverse => NamedKey::PlaySpeedDown,
+        Keysym::XF86_FastReverse => NamedKey::PlaySpeedUp,
+        Keysym::XF86_AudioRandomPlay => NamedKey::RandomToggle,
+        Keysym::XF86_SplitScreen => NamedKey::SplitScreenToggle,
+
+        Keysym::F1 => NamedKey::F1,
+        Keysym::F2 => NamedKey::F2,
+        Keysym::F3 => NamedKey::F3,
+        Keysym::F4 => NamedKey::F4,
+        Keysym::F5 => NamedKey::F5,
+        Keysym::F6 => NamedKey::F6,
+        Keysym::F7 => NamedKey::F7,
+        Keysym::F8 => NamedKey::F8,
+        Keysym::F9 => NamedKey::F9,
+        Keysym::F10 => NamedKey::F10,
+        Keysym::F11 => NamedKey::F11,
+        Keysym::F12 => NamedKey::F12,
+        Keysym::F13 => NamedKey::F13,
+        Keysym::F14 => NamedKey::F14,
+        Keysym::F15 => NamedKey::F15,
+        Keysym::F16 => NamedKey::F16,
+        Keysym::F17 => NamedKey::F17,
+        Keysym::F18 => NamedKey::F18,
+        Keysym::F19 => NamedKey::F19,
+        Keysym::F20 => NamedKey::F20,
+        Keysym::F21 => NamedKey::F21,
+        Keysym::F22 => NamedKey::F22,
+        Keysym::F23 => NamedKey::F23,
+        Keysym::F24 => NamedKey::F24,
+        Keysym::F25 => NamedKey::F25,
+        Keysym::F26 => NamedKey::F26,
+        Keysym::F27 => NamedKey::F27,
+        Keysym::F28 => NamedKey::F28,
+        Keysym::F29 => NamedKey::F29,
+        Keysym::F30 => NamedKey::F30,
+        Keysym::F31 => NamedKey::F31,
+        Keysym::F32 => NamedKey::F32,
+        Keysym::F33 => NamedKey::F33,
+        Keysym::F34 => NamedKey::F34,
+        Keysym::F35 => NamedKey::F35,
+
+        _ => NamedKey::Unidentified,
+    }
+}
+
+#[inline(always)]
+fn from_wayland_code(code: u32) -> Code {
+    match code {
+        0 => Code::Unidentified, // KEY_RESERVED
+        1 => Code::Escape,
+        2 => Code::Digit1,
+        3 => Code::Digit2,
+        4 => Code::Digit3,
+        5 => Code::Digit4,
+        6 => Code::Digit5,
+        7 => Code::Digit6,
+        8 => Code::Digit7,
+        9 => Code::Digit8,
+        10 => Code::Digit9,
+        11 => Code::Digit0,
+        12 => Code::Minus,
+        13 => Code::Equal,
+        14 => Code::Backspace,
+        15 => Code::Tab,
+        16 => Code::KeyQ,
+        17 => Code::KeyW,
+        18 => Code::KeyE,
+        19 => Code::KeyR,
+        20 => Code::KeyT,
+        21 => Code::KeyY,
+        22 => Code::KeyU,
+        23 => Code::KeyI,
+        24 => Code::KeyO,
+        25 => Code::KeyP,
+        26 => Code::BracketLeft,
+        27 => Code::BracketRight,
+        28 => Code::Enter,
+        29 => Code::ControlLeft,
+        30 => Code::KeyA,
+        31 => Code::KeyS,
+        32 => Code::KeyD,
+        33 => Code::KeyF,
+        34 => Code::KeyG,
+        35 => Code::KeyH,
+        36 => Code::KeyJ,
+        37 => Code::KeyK,
+        38 => Code::KeyL,
+        39 => Code::Semicolon,
+        40 => Code::Quote,
+        41 => Code::Backquote,
+        42 => Code::ShiftLeft,
+        43 => Code::Backslash,
+        44 => Code::KeyZ,
+        45 => Code::KeyX,
+        46 => Code::KeyC,
+        47 => Code::KeyV,
+        48 => Code::KeyB,
+        49 => Code::KeyN,
+        50 => Code::KeyM,
+        51 => Code::Comma,
+        52 => Code::Period,
+        53 => Code::Slash,
+        54 => Code::ShiftRight,
+        55 => Code::NumpadMultiply,
+        56 => Code::AltLeft,
+        57 => Code::Space,
+        58 => Code::CapsLock,
+        59 => Code::F1,
+        60 => Code::F2,
+        61 => Code::F3,
+        62 => Code::F4,
+        63 => Code::F5,
+        64 => Code::F6,
+        65 => Code::F7,
+        66 => Code::F8,
+        67 => Code::F9,
+        68 => Code::F10,
+        69 => Code::NumLock,
+        70 => Code::ScrollLock,
+        71 => Code::Numpad7,
+        72 => Code::Numpad8,
+        73 => Code::Numpad9,
+        74 => Code::NumpadSubtract,
+        75 => Code::Numpad4,
+        76 => Code::Numpad5,
+        77 => Code::Numpad6,
+        78 => Code::NumpadAdd,
+        79 => Code::Numpad1,
+        80 => Code::Numpad2,
+        81 => Code::Numpad3,
+        82 => Code::Numpad0,
+        83 => Code::NumpadDecimal,
+
+        // 85 => Code::ZenkakuHankaku,
+        86 => Code::IntlBackslash,
+        87 => Code::F11,
+        88 => Code::F12,
+        // 89 => Code::Ro,
+        90 => Code::Katakana,
+        91 => Code::Hiragana,
+        // 92 => Code::Henkan,
+        // 93 => Code::KatakanaHiragana,
+        // 94 => Code::Muhenkan,
+        95 => Code::NumpadComma,
+        96 => Code::NumpadEnter,
+        97 => Code::ControlRight,
+        98 => Code::NumpadDivide,
+        99 => Code::PrintScreen,
+        100 => Code::AltRight,
+        // 101 => Code::LineFeed,
+        102 => Code::Home,
+        103 => Code::ArrowUp,
+        104 => Code::PageUp,
+        105 => Code::ArrowLeft,
+        106 => Code::ArrowRight,
+        107 => Code::End,
+        108 => Code::ArrowDown,
+        109 => Code::PageDown,
+        110 => Code::Insert,
+        111 => Code::Delete,
+
+        // 112 => Code::Macro,
+        // 113 => Code::Mute,
+        // 114 => Code::VolumeDown,
+        // 115 => Code::VolumeUp,
+        116 => Code::Power,
+        117 => Code::NumpadEqual,
+        // 118 => Code::NumpadPlusMinus,
+        119 => Code::Pause,
+        // 120 => Code::Scale,
+
+        // 122 => Code::Hangeul,
+        // 123 => Code::Hanja,
+        // 124 => Code::Yen,
+        125 => Code::MetaLeft,
+        126 => Code::MetaRight,
+        // 127 => Code::Compose,
+
+        // 128 => Code::Stop,
+        129 => Code::Again,
+        130 => Code::Props,
+        131 => Code::Undo,
+        // 132 => Code::Front,
+        133 => Code::Copy,
+        134 => Code::Open,
+        135 => Code::Paste,
+        136 => Code::Find,
+        137 => Code::Cut,
+        138 => Code::Help,
+        139 => Code::ContextMenu,
+        // 140 => Code::Calculator,
+        // 141 => Code::Setup,
+        142 => Code::Sleep,
+        143 => Code::WakeUp,
+        // 144 => Code::File,
+        // 145 => Code::SendFile,
+        // 146 => Code::DeleteFile,
+        // 147 => Code::Xfer,
+        // 148 => Code::Prog1,
+        // 149 => Code::Prog2,
+        // 150 => Code::WWW,
+        // 151 => Code::MSDOS,
+        // 152 => Code::Coffee,
+        // 153 => Code::RotateDisplay,
+        // 154 => Code::CycleWindows,
+        // 155 => Code::Mail,
+        // 156 => Code::Bookmarks,
+        // 157 => Code::Computer,
+        // 158 => Code::Back,
+        // 159 => Code::Forward,
+        // 160 => Code::CloseCD,
+        // 161 => Code::EjectCD,
+        // 162 => Code::EjectCloseCD,
+        // 163 => Code::NextSong,
+        // 164 => Code::PlayPause,
+        // 165 => Code::PreviousSong,
+        // 166 => Code::StopCD,
+        // 167 => Code::Record,
+        // 168 => Code::Rewind,
+        // 169 => Code::Phone,
+        // 170 => Code::ISO,
+        // 171 => Code::Config,
+        // 172 => Code::HomePage,
+        // 173 => Code::Refresh,
+        // 174 => Code::Exit,
+        // 175 => Code::Move,
+        // 176 => Code::Edit,
+        // 177 => Code::ScrollUp,
+        // 178 => Code::ScrollDown,
+        179 => Code::NumpadParenLeft,
+        180 => Code::NumpadParenRight,
+        // 181 => Code::New,
+        // 182 => Code::Redo,
+        183 => Code::F13,
+        184 => Code::F14,
+        185 => Code::F15,
+        186 => Code::F16,
+        187 => Code::F17,
+        188 => Code::F18,
+        189 => Code::F19,
+        190 => Code::F20,
+        191 => Code::F21,
+        192 => Code::F22,
+        193 => Code::F23,
+        194 => Code::F24,
+
+        // 200 => Code::PlayCD,
+        // 201 => Code::PauseCD,
+        // 202 => Code::Prog3,
+        // 203 => Code::Prog4,
+        // 204 => Code::AllApplications,
+        205 => Code::Suspend,
+        // 206 => Code::Close,
+        // 207 => Code::Play,
+        // 208 => Code::FastForward,
+        // 209 => Code::BassBoost,
+        // 210 => Code::Print,
+        // 211 => Code::Hp,
+        // 212 => Code::Camera,
+        // 213 => Code::Sound,
+        // 214 => Code::Question,
+        // 215 => Code::Email,
+        // 216 => Code::Chat,
+        // 217 => Code::Search,
+        // 218 => Code::Connect,
+        // 219 => Code::Finance,
+        // 220 => Code::Sport,
+        // 221 => Code::Shop,
+        // 222 => Code::AltErase,
+        // 223 => Code::Cancel,
+        224 => Code::BrightnessDown,
+        225 => Code::BrightnessUp,
+        // 226 => Code::Media,
+        // 227 => Code::SwitchVideoMode,
+        // 228 => Code::KbdIllumToggle,
+        // 229 => Code::KbdIllumDown,
+        // 230 => Code::KbdIllumUp,
+        // 231 => Code::Send,
+        // 232 => Code::Reply,
+        // 233 => Code::ForwardMail,
+        // 234 => Code::Save,
+        // 235 => Code::Documents,
+        // 236 => Code::Battery,
+        // 237 => Code::Bluetooth,
+        // 238 => Code::WLAN,
+        // 239 => Code::UWB,
+
+        // 240 => Code::Unknown,
+        // 241 => Code::VideoNext,
+        // 242 => Code::VideoPrev,
+        // 243 => Code::BrightnessCycle,
+        // 244 => Code::BrightnessAuto,
+        // 245 => Code::DisplayOff,
+        // 246 => Code::WWAN,
+        // 247 => Code::RfKill,
+        // 248 => Code::MicMute,
+        _ => Code::Unidentified,
+    }
+}

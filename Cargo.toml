@@ -1,0 +1,19 @@
+[package]
+name = "smithay-winit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+accesskit = "0.21.1"
+accesskit_unix = { version = "0.17.0", features = [
+    "tokio",
+], default-features = false }
+cursor-icon = "1.2.0"
+dpi = "0.1.2"
+raw-window-handle = "0.6.2"
+smithay-client-toolkit = "0.20.0"
+sctk-adwaita = { version = "0.11.0", default-features = false }
+tracing = { version = "0.1.41", features = ["default"] }
+ui-events = "0.1.0"
+wayland-backend = { version = "0.3.11", features = ["client_system", "dlopen"] }
+indexmap = "2.11.4"
