@@ -12,7 +12,7 @@ use smithay_client_toolkit::{
 use tracing::error;
 use ui_events::pointer::{PointerButton, PointerEvent, PointerState, PointerUpdate};
 
-use crate::{Events, WaylandState};
+use crate::{Events, WaylandState, WindowId};
 
 impl PointerHandler for WaylandState {
     fn pointer_frame(
@@ -22,36 +22,37 @@ impl PointerHandler for WaylandState {
         pointer: &WlPointer,
         events: &[WlPointerEvent],
     ) {
-        if let Some(mouse) = self.seat_state.pointers.info(pointer.id()) {
+        if let Some(mouse) = self.seat_state.pointers.info(pointer.id().into()) {
             for event in events {
                 let surface = &event.surface;
                 let id = surface.id();
 
-                let parent_id = surface
+                let parent_id: WindowId = surface
                     .data::<SurfaceData>()
                     .and_then(|data| data.parent_surface().map(|s| s.id()))
-                    .unwrap_or(id.clone());
+                    .unwrap_or(id.clone().into())
+                    .into();
 
                 let pointer_kind = match event.kind {
                     PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. } => {
                         self.pointer_kind(pointer)
                     }
                     PointerEventKind::Press { .. } | PointerEventKind::Release { .. }
-                        if parent_id != id =>
+                        if parent_id != id.clone().into() =>
                     {
                         self.windows.redraw_request.insert(parent_id.clone());
                         None
                     }
                     _ => None,
                 };
-                if let Some(window) = self.windows.get_mut_by_object_id(&parent_id) {
+                if let Some(window) = self.windows.get_mut(&parent_id) {
                     let position = LogicalPosition::<f64>::from(event.position);
                     let mut state = PointerState {
                         position: position.to_physical(window.scale_factor as f64),
                         modifiers: self.seat_state.modifiers,
                         ..Default::default()
                     };
-                    if parent_id != id {
+                    if parent_id != id.into() {
                         // Decoration events
                         match event.kind {
                             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
@@ -102,7 +103,7 @@ impl PointerHandler for WaylandState {
                                     })
                                 {
                                     if window.frame_action(pointer, serial, action) {
-                                        self.windows.close_request.insert(parent_id.to_owned());
+                                        self.windows.close_request.insert(parent_id);
                                     }
                                 }
                             }

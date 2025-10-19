@@ -24,11 +24,14 @@ impl KeyboardHandler for WaylandState {
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         let id = surface.id();
-        if self.windows.get_mut_by_object_id(&id).is_some() {
-            if let Err(err) = self.event_sender.send(Events::Focus(id.clone(), true)) {
+        if self.windows.get_mut(&id.clone().into()).is_some() {
+            if let Err(err) = self
+                .event_sender
+                .send(Events::Focus(id.clone().into(), true))
+            {
                 error!("{err}");
             }
-            self.seat_state.keyboard_focus = Some(id);
+            self.seat_state.keyboard_focus = Some(id.into());
         }
     }
 
@@ -41,7 +44,7 @@ impl KeyboardHandler for WaylandState {
         _serial: u32,
     ) {
         let id = surface.id();
-        if let Err(err) = self.event_sender.send(Events::Focus(id, false)) {
+        if let Err(err) = self.event_sender.send(Events::Focus(id.into(), false)) {
             error!("{err}");
         }
         self.seat_state.keyboard_focus = None;

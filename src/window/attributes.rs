@@ -1,34 +1,34 @@
-use std::{
-    num::NonZeroU64,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
 use dpi::Size;
-use tracing::field::DisplayValue;
+use wayland_backend::client::ObjectId;
 
-/// A unique and persistent identifier for a window.
-///
-/// [`MasonryState`] internally maps these to winit window ids ([`winit::window::WindowId`]).
-/// Applications should only use this struct and not be concerned with the winit window ids.
-/// When the application is suspended and resumed this id will stay the same, while the
-/// winit window id will change.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct WindowId(pub(crate) NonZeroU64);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowId(ObjectId);
 
 impl WindowId {
-    /// Allocate a new, unique `WindowId`.
-    ///
-    /// You must ensure that a given `WindowId` is only ever used for one
-    /// window at a time.
-    pub fn next() -> Self {
-        static WINDOW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-        let id = WINDOW_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(id.try_into().unwrap())
+    pub fn inner(&self) -> &ObjectId {
+        &self.0
     }
 
-    /// A serialized representation of the `WindowId` for debugging purposes.
-    pub fn trace(self) -> DisplayValue<NonZeroU64> {
-        tracing::field::display(self.0)
+    pub fn into_inner(self) -> ObjectId {
+        self.0
+    }
+}
+
+impl From<ObjectId> for WindowId {
+    fn from(id: ObjectId) -> Self {
+        WindowId(id)
+    }
+}
+
+impl From<WindowId> for ObjectId {
+    fn from(window_id: WindowId) -> Self {
+        window_id.0
+    }
+}
+
+impl std::fmt::Display for WindowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WindowId({:?})", self.0)
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod attributes;
+pub mod locked;
 pub mod registry;
 
 use std::{
@@ -31,7 +32,7 @@ use smithay_client_toolkit::{
 };
 use smithay_client_toolkit::{
     reexports::{
-        calloop::channel::Sender as WlSender, client::backend::ObjectId,
+        calloop::channel::Sender as WlSender,
         protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge,
     },
     shell::WaylandSurface,
@@ -59,8 +60,7 @@ pub(crate) const DEFAULT_SCALE_FACTOR: i32 = 1;
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
 pub struct WindowImmutable {
-    pub(crate) object_id: ObjectId,
-    pub(crate) window_id: WindowId,
+    pub(crate) id: WindowId,
     pub(crate) window: Window,
     /// The wayland display used solely for raw window handle.
     #[allow(dead_code)]
@@ -68,26 +68,29 @@ pub struct WindowImmutable {
 }
 
 impl WindowImmutable {
-    pub fn new(window: Window, display: WlDisplay, id: WindowId) -> Self {
+    pub fn new(window: Window, display: WlDisplay) -> Self {
         Self {
-            object_id: window.wl_surface().id(),
-            window_id: id,
+            id: window.wl_surface().id().into(),
             window,
             display,
         }
     }
 
+    pub fn get_id(&self) -> WindowId {
+        self.id.clone()
+    }
+
     #[inline]
-    pub fn raw_window_handle_rwh_06(&self) -> Result<RawWindowHandle, HandleError> {
+    pub(crate) fn raw_window_handle_rwh_06(&self) -> Result<RawWindowHandle, HandleError> {
         Ok(WaylandWindowHandle::new({
-            let ptr = self.object_id.as_ptr();
+            let ptr = self.window.wl_surface().id().as_ptr();
             std::ptr::NonNull::new(ptr as *mut _).expect("wl_surface will never be null")
         })
         .into())
     }
 
     #[inline]
-    pub fn raw_display_handle_rwh_06(&self) -> Result<RawDisplayHandle, HandleError> {
+    pub(crate) fn raw_display_handle_rwh_06(&self) -> Result<RawDisplayHandle, HandleError> {
         Ok(WaylandDisplayHandle::new({
             let ptr = self.display.id().as_ptr();
             std::ptr::NonNull::new(ptr as *mut _).expect("wl_proxy should never be null")
@@ -130,11 +133,9 @@ pub struct WaylandWindow {
 
 impl WaylandWindow {
     pub(crate) fn new(
-        window: Window,
+        immutable: Arc<WindowImmutable>,
         last_output: Option<&WlOutput>,
-        window_id: WindowId,
         attr: WindowAttributes,
-        display: WlDisplay,
         event_sender: WlSender<Events>,
         accesskit_adapter: Adapter,
         region: Option<Region>,
@@ -142,19 +143,19 @@ impl WaylandWindow {
     ) -> Self {
         // Set the app_id.
         if let Some(name) = attr.app_name.map(|name| name.general) {
-            window.set_app_id(name);
+            immutable.window.set_app_id(name);
         }
 
         if attr.maximized {
-            window.set_maximized();
+            immutable.window.set_maximized();
         }
 
         if attr.fullscreen {
-            window.set_fullscreen(last_output);
+            immutable.window.set_fullscreen(last_output);
         }
 
         let mut state = Self {
-            immutable: Arc::new(WindowImmutable::new(window, display, window_id)),
+            immutable,
             state: WindowState::empty(),
             window_frame: None,
             output: None,
@@ -248,18 +249,14 @@ impl WaylandWindow {
         WindowAttributes::default()
     }
 
-    pub fn get_id(&self) -> WindowId {
-        self.immutable.window_id
-    }
-
-    pub fn get_surface_id(&self) -> &ObjectId {
-        &self.immutable.object_id
+    pub fn get_surface_id(&self) -> &WindowId {
+        &self.immutable.id
     }
 
     pub fn redraw_request(&self) {
         if let Err(err) = self
             .event_sender
-            .send(Events::RedrawRequest(self.immutable.object_id.clone()))
+            .send(Events::RedrawRequest(self.immutable.id.clone()))
         {
             error!("{err}");
         }

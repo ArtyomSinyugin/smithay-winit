@@ -4,7 +4,6 @@ use cursor_icon::CursorIcon;
 use smithay_client_toolkit::{
     reexports::client::{
         Connection, Proxy, QueueHandle,
-        backend::ObjectId,
         protocol::{wl_keyboard::WlKeyboard, wl_seat::WlSeat, wl_touch::WlTouch},
     },
     seat::{
@@ -18,8 +17,9 @@ use ui_events::{
     keyboard::Modifiers,
     pointer::{PointerEvent, PointerId, PointerInfo, PointerType},
 };
+use wayland_backend::client::ObjectId;
 
-use crate::{Events, WaylandState};
+use crate::{Events, WaylandState, WindowId};
 
 pub mod keyboard;
 pub mod pointer;
@@ -35,7 +35,7 @@ pub struct SeatState {
     pub modifiers: Modifiers,
     pub pointers: PointerRegistry,
     pub keyboard: Option<WlKeyboard>,
-    pub keyboard_focus: Option<ObjectId>,
+    pub keyboard_focus: Option<WindowId>,
 }
 
 impl SeatState {
@@ -183,8 +183,8 @@ impl SeatHandler for WaylandState {
                         pointer_type: PointerType::Mouse,
                     };
                     self.seat_state.pointers.add(
-                        seat.id(),
-                        pointer_id,
+                        seat.id().into(),
+                        pointer_id.into(),
                         PointerKind::Mouse(pointer),
                         info,
                     );
@@ -199,8 +199,8 @@ impl SeatHandler for WaylandState {
                         pointer_type: PointerType::Mouse,
                     };
                     self.seat_state.pointers.add(
-                        seat.id(),
-                        touch_id,
+                        seat.id().into(),
+                        touch_id.into(),
                         PointerKind::Touch(touch),
                         info,
                     );
@@ -234,7 +234,7 @@ impl SeatHandler for WaylandState {
                 self.seat_state.keyboard.take().unwrap().release()
             }
             Capability::Pointer | Capability::Touch => {
-                if let Some(info) = self.seat_state.pointers.remove(seat.id()) {
+                if let Some(info) = self.seat_state.pointers.remove(seat.id().into()) {
                     for (id, _) in &self.windows.windows {
                         if let Err(err) = self
                             .event_sender

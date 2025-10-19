@@ -7,15 +7,14 @@ use smithay_client_toolkit::{
     activation::{ActivationHandler as WlActivationHandler, ActivationState, RequestData},
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_activation, delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_touch,
-    delegate_xdg_shell, delegate_xdg_window,
+    delegate_registry, delegate_seat, delegate_session_lock, delegate_shm, delegate_subcompositor,
+    delegate_touch, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     reexports::{
         calloop::{self, EventLoop, LoopHandle, RegistrationToken, channel::Sender as WlSender},
         calloop_wayland_source::WaylandSource,
         client::{
             Connection, Proxy, QueueHandle,
-            backend::ObjectId,
             globals::registry_queue_init,
             protocol::{
                 wl_output::{Transform, WlOutput},
@@ -28,6 +27,10 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{SeatState as WlSeatState, pointer::PointerData},
+    session_lock::{
+        SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
+        SessionLockSurfaceConfigure,
+    },
     shell::{
         WaylandSurface,
         xdg::{
@@ -42,8 +45,9 @@ use tracing::error;
 
 use crate::{
     AccesskitEvents, AccesskitHandler, Events, ViewporterState, WaylandWindow, WindowAttributes,
-    WindowId, WindowsRegistry,
+    WindowId, WindowImmutable, WindowsRegistry,
     seat::{PointerKind, SeatState},
+    window::locked::LockedSurface,
 };
 
 pub struct WaylandState {
@@ -99,6 +103,9 @@ pub struct WaylandState {
     // The pool where images are allocated (used for window icons and custom cursors)
     // Пока непонятно, зачем мне это нужно. Возможно, xilem выделяет буфер самостоятельно как то
     // pub image_pool: SlotPool,
+    session_lock_state: SessionLockState,
+    session_lock: Option<SessionLock>,
+    lock_surfaces: Vec<LockedSurface>,
 }
 
 impl WaylandState {
@@ -112,7 +119,7 @@ impl WaylandState {
         let event_loop: EventLoop<'static, WaylandState> =
             EventLoop::try_new().expect("Failed to initialize the event loop!");
         let loop_handle = event_loop.handle();
-        WaylandSource::new(conn.clone(), event_queue)
+        let token = WaylandSource::new(conn.clone(), event_queue)
             .insert(loop_handle)
             .unwrap();
         // The compositor (not to be confused with the server which is commonly called the compositor) allows
@@ -158,7 +165,7 @@ impl WaylandState {
                 conn,
                 event_sender,
                 accesskit_event_sender,
-                event_source_token: vec![event_source_token, accesskit_source_token],
+                event_source_token: vec![token, event_source_token, accesskit_source_token],
                 running: false,
                 compositor_state: Arc::new(compositor),
                 subcompositor_state: subcompositor,
@@ -173,6 +180,9 @@ impl WaylandState {
                 activation_state,
                 accesskit_events: VecDeque::new(),
                 events: VecDeque::new(),
+                session_lock_state: SessionLockState::new(&globals, &queue_handle),
+                session_lock: None,
+                lock_surfaces: Vec::new(),
                 queue_handle,
                 loop_handle: event_loop.handle(),
                 csd_fails: true,
@@ -182,7 +192,30 @@ impl WaylandState {
         )
     }
 
-    pub fn create_window(&mut self, (id, new_window): (WindowId, WindowAttributes)) {
+    pub fn create_locked_surfaces(&mut self) {
+        if let Some(session_lock) = self.session_lock.as_ref() {
+            for output in self.output_state.outputs() {
+                let surface = self.compositor_state.create_surface(&self.queue_handle);
+                let accesskit =
+                    AccesskitHandler::new(surface.id().into(), self.accesskit_event_sender.clone());
+
+                let accesskit_adapter =
+                    Adapter::new(accesskit.clone(), accesskit.clone(), accesskit);
+
+                // It's important to keep the `SessionLockSurface` returned here around, as the
+                // surface will be destroyed when the `SessionLockSurface` is dropped.
+                let lock_surface =
+                    session_lock.create_lock_surface(surface, &output, &self.queue_handle);
+
+                // let locked_surface =
+                //     LockedSurface::new(lock_surface, self.conn.display(), accesskit_adapter);
+
+                // self.lock_surfaces.push(locked_surface);
+            }
+        }
+    }
+
+    pub fn create_window(&mut self, new_window: WindowAttributes) {
         let surface = self.compositor_state.create_surface(&self.queue_handle);
         let viewport = self
             .viewport_state
@@ -199,7 +232,8 @@ impl WaylandState {
             .xdg_shell
             .create_window(surface, decorations, &self.queue_handle);
 
-        let accesskit = AccesskitHandler::new(wl_id.clone(), self.accesskit_event_sender.clone());
+        let accesskit =
+            AccesskitHandler::new(wl_id.clone().into(), self.accesskit_event_sender.clone());
 
         let accesskit_adapter = Adapter::new(accesskit.clone(), accesskit.clone(), accesskit);
 
@@ -224,15 +258,15 @@ impl WaylandState {
             )
         }
 
+        let immutable = Arc::new(WindowImmutable::new(window, self.conn.display()));
+        self.windows.new_windows.push(immutable.clone());
+
         self.windows.insert(
-            id,
-            wl_id,
+            wl_id.into(),
             WaylandWindow::new(
-                window,
+                immutable,
                 self.last_output.as_ref(),
-                id,
                 new_window,
-                self.conn.display(),
                 self.event_sender.clone(),
                 accesskit_adapter,
                 Region::new(&*self.compositor_state).ok(),
@@ -241,7 +275,7 @@ impl WaylandState {
         );
     }
 
-    pub fn close_window(&mut self, id: &ObjectId) -> WindowId {
+    pub fn close_window(&mut self, id: &WindowId) -> WindowId {
         // Panic, if there is no windows to remove
         let id = self.windows.remove(&id);
         if self.windows.is_empty() {
@@ -289,8 +323,8 @@ impl CompositorHandler for WaylandState {
         surface: &WlSurface,
         new_factor: i32,
     ) {
-        let id = surface.id();
-        if let Some(window) = self.windows.get_mut_by_object_id(&id) {
+        let id = surface.id().into();
+        if let Some(window) = self.windows.get_mut(&id) {
             window.scale_factor = new_factor;
             self.windows.rescale_request.insert(id);
         }
@@ -312,7 +346,7 @@ impl CompositorHandler for WaylandState {
         surface: &WlSurface,
         _time: u32,
     ) {
-        let id = surface.id();
+        let id = surface.id().into();
         self.windows.redraw_request.insert(id);
     }
 
@@ -325,7 +359,7 @@ impl CompositorHandler for WaylandState {
     ) {
         self.last_output = Some(output.clone());
         tracing::debug!("Last output");
-        if let Some(window) = self.windows.get_mut_by_object_id(&surface.id()) {
+        if let Some(window) = self.windows.get_mut(&surface.id().into()) {
             window.output = Some(output.to_owned());
             tracing::debug!("Window output");
         }
@@ -362,7 +396,7 @@ impl ShmHandler for WaylandState {
 
 impl WindowHandler for WaylandState {
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
-        let id = window.wl_surface().id();
+        let id = window.wl_surface().id().into();
         self.windows.close_request.insert(id);
     }
 
@@ -374,9 +408,9 @@ impl WindowHandler for WaylandState {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        let id = window.wl_surface().id();
+        let id = window.wl_surface().id().into();
         let mut resize = false;
-        if let Some(window) = self.windows.get_mut_by_object_id(&id) {
+        if let Some(window) = self.windows.get_mut(&id) {
             if configure.decoration_mode == DecorationMode::Client
                 && window.window_frame.is_none()
                 && self.subcompositor_state.is_some()
@@ -468,6 +502,27 @@ impl WindowHandler for WaylandState {
     }
 }
 
+impl SessionLockHandler for WaylandState {
+    fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _session_lock: SessionLock) {
+        todo!()
+    }
+
+    fn finished(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _session_lock: SessionLock) {
+        todo!()
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: SessionLockSurface,
+        _configure: SessionLockSurfaceConfigure,
+        _serial: u32,
+    ) {
+        todo!()
+    }
+}
+
 impl WlActivationHandler for WaylandState {
     type RequestData = RequestData;
 
@@ -488,6 +543,7 @@ delegate_seat!(WaylandState);
 delegate_keyboard!(WaylandState);
 delegate_pointer!(WaylandState);
 delegate_touch!(WaylandState);
+delegate_session_lock!(WaylandState);
 
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
