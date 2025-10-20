@@ -44,8 +44,8 @@ use smithay_client_toolkit::{
 use tracing::error;
 
 use crate::{
-    AccesskitEvents, AccesskitHandler, Events, ViewporterState, WaylandWindow, WindowAttributes,
-    WindowId, WindowImmutable, WindowsRegistry,
+    AccesskitEvents, AccesskitHandler, Events, WindowCore, ViewporterState, WaylandWindow,
+    WindowAttributes, WindowId, WindowsRegistry,
     seat::{PointerKind, SeatState},
     window::locked::LockedSurface,
 };
@@ -258,13 +258,14 @@ impl WaylandState {
             )
         }
 
-        let immutable = Arc::new(WindowImmutable::new(window, self.conn.display()));
+        let immutable = Arc::new(WindowCore::new(wl_id.clone().into(), self.conn.display()));
         self.windows.new_windows.push(immutable.clone());
 
         self.windows.insert(
             wl_id.into(),
             WaylandWindow::new(
                 immutable,
+                window,
                 self.last_output.as_ref(),
                 new_window,
                 self.event_sender.clone(),
@@ -417,7 +418,7 @@ impl WindowHandler for WaylandState {
                 && self.csd_fails
             {
                 match AdwaitaFrame::new(
-                    &window.immutable.window,
+                    &window.window,
                     &self.shm,
                     self.compositor_state.clone(),
                     self.subcompositor_state.as_ref().unwrap().clone(),

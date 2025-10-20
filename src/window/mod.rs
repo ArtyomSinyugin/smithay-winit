@@ -45,6 +45,7 @@ use smithay_client_toolkit::{
     shell::xdg::window::WindowConfigure,
 };
 use tracing::error;
+use wayland_backend::client::ObjectId;
 
 use crate::{
     Events, WaylandState, WindowAttributes, WindowId, seat::PointerKind,
@@ -59,21 +60,16 @@ pub(crate) const DEFAULT_SCALE_FACTOR: i32 = 1;
 // Minimum window surface size.
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
-pub struct WindowImmutable {
+pub struct WindowCore {
     pub(crate) id: WindowId,
-    pub(crate) window: Window,
     /// The wayland display used solely for raw window handle.
     #[allow(dead_code)]
     display: WlDisplay,
 }
 
-impl WindowImmutable {
-    pub fn new(window: Window, display: WlDisplay) -> Self {
-        Self {
-            id: window.wl_surface().id().into(),
-            window,
-            display,
-        }
+impl WindowCore {
+    pub fn new(id: WindowId, display: WlDisplay) -> Self {
+        Self { id, display }
     }
 
     pub fn get_id(&self) -> WindowId {
@@ -83,7 +79,7 @@ impl WindowImmutable {
     #[inline]
     pub(crate) fn raw_window_handle_rwh_06(&self) -> Result<RawWindowHandle, HandleError> {
         Ok(WaylandWindowHandle::new({
-            let ptr = self.window.wl_surface().id().as_ptr();
+            let ptr = ObjectId::from(self.id.clone()).as_ptr();
             std::ptr::NonNull::new(ptr as *mut _).expect("wl_surface will never be null")
         })
         .into())
@@ -101,7 +97,8 @@ impl WindowImmutable {
 
 /// New window
 pub struct WaylandWindow {
-    pub immutable: Arc<WindowImmutable>,
+    pub core: Arc<WindowCore>,
+    pub(crate) window: Window,
     pub(crate) title: String,
     pub(crate) visible: bool,
     pub(crate) resizable: bool,
@@ -133,7 +130,8 @@ pub struct WaylandWindow {
 
 impl WaylandWindow {
     pub(crate) fn new(
-        immutable: Arc<WindowImmutable>,
+        immutable: Arc<WindowCore>,
+        window: Window,
         last_output: Option<&WlOutput>,
         attr: WindowAttributes,
         event_sender: WlSender<Events>,
@@ -143,19 +141,20 @@ impl WaylandWindow {
     ) -> Self {
         // Set the app_id.
         if let Some(name) = attr.app_name.map(|name| name.general) {
-            immutable.window.set_app_id(name);
+            window.set_app_id(name);
         }
 
         if attr.maximized {
-            immutable.window.set_maximized();
+            window.set_maximized();
         }
 
         if attr.fullscreen {
-            immutable.window.set_fullscreen(last_output);
+            window.set_fullscreen(last_output);
         }
 
         let mut state = Self {
-            immutable,
+            core: immutable,
+            window,
             state: WindowState::empty(),
             window_frame: None,
             output: None,
@@ -185,7 +184,6 @@ impl WaylandWindow {
         if state.decorations {
             // TODO: do we need to make this request or not?
             state
-                .immutable
                 .window
                 .request_decoration_mode(Some(DecorationMode::Server));
         }
@@ -217,7 +215,7 @@ impl WaylandWindow {
             .unwrap_or(size);
 
         self.min_surface_size = size;
-        self.immutable.window.set_min_size(Some(size.into()));
+        self.window.set_min_size(Some(size.into()));
     }
 
     /// Set maximum inner window size.
@@ -230,7 +228,7 @@ impl WaylandWindow {
         });
 
         self.max_surface_size = size;
-        self.immutable.window.set_max_size(size.map(Into::into));
+        self.window.set_max_size(size.map(Into::into));
     }
 
     pub fn frame_config(&self) -> FrameConfig {
@@ -250,13 +248,13 @@ impl WaylandWindow {
     }
 
     pub fn get_surface_id(&self) -> &WindowId {
-        &self.immutable.id
+        &self.core.id
     }
 
     pub fn redraw_request(&self) {
         if let Err(err) = self
             .event_sender
-            .send(Events::RedrawRequest(self.immutable.id.clone()))
+            .send(Events::RedrawRequest(self.core.id.clone()))
         {
             error!("{err}");
         }
@@ -277,8 +275,7 @@ impl WaylandWindow {
         self.decorate = decorate;
 
         if self.decorate {
-            self.immutable
-                .window
+            self.window
                 .request_decoration_mode(Some(DecorationMode::Server));
         }
 
@@ -308,7 +305,7 @@ impl WaylandWindow {
             frame.set_title(&title);
         }
 
-        self.immutable.window.set_title(&title);
+        self.window.set_title(&title);
         self.title = title;
     }
 
@@ -339,7 +336,7 @@ impl WaylandWindow {
 
     /// Start the window drag.
     pub fn drag_window(&self) {
-        let xdg_toplevel = self.immutable.window.xdg_toplevel();
+        let xdg_toplevel = self.window.xdg_toplevel();
         self.apply_on_pointer(|pointer| {
             if let (Some(serial), Some(seat)) = (pointer.latest_serial(), pointer.seat()) {
                 xdg_toplevel._move(seat, serial);
@@ -349,7 +346,7 @@ impl WaylandWindow {
 
     /// Start interacting drag resize.
     pub fn drag_resize_window(&self, direction: XdgResizeEdge) {
-        let xdg_toplevel = self.immutable.window.xdg_toplevel();
+        let xdg_toplevel = self.window.xdg_toplevel();
 
         self.apply_on_pointer(|pointer| {
             if let (Some(serial), Some(seat)) = (pointer.latest_serial(), pointer.seat()) {
@@ -363,9 +360,7 @@ impl WaylandWindow {
         let position: LogicalPosition<u32> = position.to_logical(self.scale_factor as f64);
         self.apply_on_pointer(|pointer| {
             if let (Some(serial), Some(seat)) = (pointer.latest_serial(), pointer.seat()) {
-                self.immutable
-                    .window
-                    .show_window_menu(seat, serial, position.into());
+                self.window.show_window_menu(seat, serial, position.into());
             }
         });
     }
@@ -389,7 +384,7 @@ impl WaylandWindow {
     /// Is [`WindowState::FULLSCREEN`] state is set.
     #[inline]
     pub fn set_fullscreen(&self) {
-        self.immutable.window.set_fullscreen(self.output.as_ref());
+        self.window.set_fullscreen(self.output.as_ref());
     }
 
     #[inline]
@@ -401,7 +396,7 @@ impl WaylandWindow {
     #[inline]
     pub fn set_minimized(&self) {
         // You can't unminimize the window on Wayland.
-        self.immutable.window.set_minimized();
+        self.window.set_minimized();
     }
 
     #[inline]
@@ -412,9 +407,9 @@ impl WaylandWindow {
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
         if maximized {
-            self.immutable.window.set_maximized()
+            self.window.set_maximized()
         } else {
-            self.immutable.window.unset_maximized()
+            self.window.unset_maximized()
         }
     }
 
@@ -434,12 +429,10 @@ impl WaylandWindow {
         tracing::debug!("Frame action: {:?}", action);
         match action {
             FrameAction::Close => return true,
-            FrameAction::Minimize => self.immutable.window.set_minimized(),
-            FrameAction::Maximize => self.immutable.window.set_maximized(),
-            FrameAction::UnMaximize => self.immutable.window.unset_maximized(),
-            FrameAction::ShowMenu(x, y) => {
-                self.immutable.window.show_window_menu(seat, serial, (x, y))
-            }
+            FrameAction::Minimize => self.window.set_minimized(),
+            FrameAction::Maximize => self.window.set_maximized(),
+            FrameAction::UnMaximize => self.window.unset_maximized(),
+            FrameAction::ShowMenu(x, y) => self.window.show_window_menu(seat, serial, (x, y)),
             FrameAction::Resize(edge) => {
                 let edge = match edge {
                     ResizeEdge::None => XdgResizeEdge::None,
@@ -453,9 +446,9 @@ impl WaylandWindow {
                     ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
                     _ => return false,
                 };
-                self.immutable.window.resize(seat, serial, edge);
+                self.window.resize(seat, serial, edge);
             }
-            FrameAction::Move => self.immutable.window.move_(seat, serial),
+            FrameAction::Move => self.window.move_(seat, serial),
             _ => (),
         }
         false
@@ -516,7 +509,7 @@ impl WaylandWindow {
         self.reload_transparency_hint();
 
         // Set the window geometry.
-        self.immutable.window.xdg_surface().set_window_geometry(
+        self.window.xdg_surface().set_window_geometry(
             x,
             y,
             outer_size.width as i32,
@@ -532,7 +525,7 @@ impl WaylandWindow {
 
     /// Reissue the transparency hint to the compositor.
     pub fn reload_transparency_hint(&self) {
-        let surface = self.immutable.window.wl_surface();
+        let surface = self.window.wl_surface();
 
         if self.transparent {
             surface.set_opaque_region(None);
@@ -555,7 +548,7 @@ impl WaylandWindow {
     }
 }
 
-impl HasWindowHandle for WindowImmutable {
+impl HasWindowHandle for WindowCore {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
         let raw = self.raw_window_handle_rwh_06()?;
 
@@ -565,7 +558,7 @@ impl HasWindowHandle for WindowImmutable {
     }
 }
 
-impl HasDisplayHandle for WindowImmutable {
+impl HasDisplayHandle for WindowCore {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
         let raw = self.raw_display_handle_rwh_06()?;
 

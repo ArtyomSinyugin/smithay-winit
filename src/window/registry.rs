@@ -2,13 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexSet;
 
-use crate::{WaylandWindow, WindowId, WindowImmutable};
+use crate::{WaylandWindow, WindowCore, WindowId};
 
 #[derive(Default)]
 pub struct WindowsRegistry {
     pub(crate) windows: HashMap<WindowId, WaylandWindow>,
-    pub(crate) new_windows: Vec<Arc<WindowImmutable>>,
-    pub(crate) new_locked_windows: Vec<WindowImmutable>,
+    pub(crate) new_windows: Vec<Arc<WindowCore>>,
+    pub(crate) new_locked_windows: Vec<WindowCore>,
     pub(crate) rescale_request: IndexSet<WindowId>,
     pub(crate) resize_request: IndexSet<WindowId>,
     pub(crate) redraw_request: IndexSet<WindowId>,
@@ -24,7 +24,7 @@ impl WindowsRegistry {
 
     pub fn remove(&mut self, id: &WindowId) -> WindowId {
         if let Some(window) = self.windows.remove(id) {
-            return window.immutable.id.clone();
+            return window.core.id.clone();
         }
         panic!("Failed to remove window");
     }

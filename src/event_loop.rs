@@ -17,7 +17,7 @@ use tracing::error;
 use ui_events::{keyboard::KeyboardEvent, pointer::PointerEvent};
 
 use crate::{
-    WaylandState, WaylandWindow, WindowAttributes, WindowId, WindowImmutable, WindowsRegistry,
+    WaylandState, WaylandWindow, WindowAttributes, WindowCore, WindowId, WindowsRegistry,
     state::logical_to_physical_rounded,
     window::{DEFAULT_SCALE_FACTOR, DEFAULT_WINDOW_SIZE},
 };
@@ -261,7 +261,7 @@ where
                         if let Some(window) = self.state.windows.get_mut(&object_id) {
                             // TODO: Чтобы делать нормальный refresh frame, нужно вызывать draw_handle, а не запрос на перерисовку
                             window.refresh_frame();
-                            app.draw_handle(&object_id, window);
+                            app.draw_handle(window.core.clone(), &mut window.accesskit_adapter);
                         }
                     }
                     for id in close_req.iter() {
@@ -295,8 +295,8 @@ pub trait ApplicationHandler<UserEvent>
 where
     UserEvent: 'static + Send,
 {
-    fn create_window(&mut self, new_window: Arc<WindowImmutable>);
-    fn draw_handle(&mut self, window_id: &WindowId, window: &mut WaylandWindow);
+    fn create_window(&mut self, new_window: Arc<WindowCore>);
+    fn draw_handle(&mut self, window: Arc<WindowCore>, adapter: &mut Adapter);
     fn keyboard_handle(&mut self, window_id: &WindowId, keyboard_event: KeyboardEvent);
     fn pointer_handle(&mut self, window_id: &WindowId, pointer_event: PointerEvent);
     fn resize_handle(&mut self, window_id: &WindowId, size: PhysicalSize<u32>);
