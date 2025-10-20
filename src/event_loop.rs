@@ -4,7 +4,7 @@ use std::{
     mem,
     rc::Rc,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -17,14 +17,16 @@ use tracing::error;
 use ui_events::{keyboard::KeyboardEvent, pointer::PointerEvent};
 
 use crate::{
-    WaylandState, WaylandWindow, WindowAttributes, WindowCore, WindowId, WindowsRegistry,
+    WaylandState, WindowAttributes, WindowCore, WindowId, WindowsRegistry,
     state::logical_to_physical_rounded,
     window::{DEFAULT_SCALE_FACTOR, DEFAULT_WINDOW_SIZE},
 };
 
 static LOOP_RUNNING: AtomicBool = AtomicBool::new(true);
+pub(crate) static SCREENLOCK: AtomicBool = AtomicBool::new(false);
 
 static WINDOWS_CREATION_EVENT: OnceLock<WlSender<WindowAttributes>> = OnceLock::new();
+static LOCKER_CREATION_EVENT: OnceLock<WlSender<()>> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum AccesskitEvents {
@@ -42,13 +44,30 @@ pub trait LoopHandler {
             // TODO: rewrite error
             .ok_or(String::from("Event loop has not been initialized yet"))
     }
-
     fn default_window_size(&self) -> LogicalSize<u32> {
         DEFAULT_WINDOW_SIZE.to_owned()
     }
 
     fn default_scale_factor(&self) -> i32 {
         DEFAULT_SCALE_FACTOR
+    }
+
+    fn screenlock(&self) -> Result<(), String> {
+        match LOCKER_CREATION_EVENT.get().and_then(|s| s.send(()).ok()) {
+            Some(_) => SCREENLOCK.store(true, Ordering::Release),
+            // TODO: rewrite error
+            None => return Err(String::from("Event loop has not been initialized yet")),
+        }
+        Ok(())
+    }
+
+    fn is_locked(&self) -> bool {
+        SCREENLOCK.load(Ordering::Acquire)
+    }
+
+    /// Do nothing when lock is not set
+    fn unlock(&self) {
+        SCREENLOCK.store(false, Ordering::Release);
     }
 
     fn stop(&self) {
@@ -137,6 +156,18 @@ where
             .expect("Failed to create user event handle");
         WINDOWS_CREATION_EVENT.set(create_window).unwrap();
 
+        // Screenlock creation preparation
+        let (create_locker, rx) = calloop::channel::channel::<()>();
+        let screenlock_token = event_loop
+            .handle()
+            .insert_source(rx, move |event, _, state| {
+                if let calloop::channel::Event::Msg(_) = event {
+                    state.lock();
+                }
+            })
+            .expect("Failed to create user event handle");
+        LOCKER_CREATION_EVENT.set(create_locker).unwrap();
+
         // User events handler preparation
         let user_events = Rc::new(RefCell::new(VecDeque::new()));
         let user_events_clone = user_events.clone();
@@ -153,6 +184,7 @@ where
         // To release sources after app exit properly
         state.event_source_token.push(create_window_token);
         state.event_source_token.push(user_event_token);
+        state.event_source_token.push(screenlock_token);
         Self {
             state,
             user_events,
@@ -170,6 +202,7 @@ where
             match self.event_loop.dispatch(None, &mut self.state) {
                 Ok(_) => {
                     let new_windows = mem::take(&mut self.state.windows.new_windows);
+                    let locked = mem::take(&mut self.state.windows.new_screenlock);
                     let rescale_req = mem::take(&mut self.state.windows.rescale_request);
                     let mut resize_req = mem::take(&mut self.state.windows.resize_request);
                     let mut redraw_req = mem::take(&mut self.state.windows.redraw_request);
@@ -178,6 +211,21 @@ where
                     // Let's notify user about all new windows to handle them
                     for window in new_windows {
                         app.create_window(window);
+                    }
+
+                    // Let's notify user about all new locked surfaces to handle them
+                    for (id, (size, surface)) in locked {
+                        match size {
+                            Some(size) => app.create_screenlock(surface, size),
+                            None => {
+                                let _ = self
+                                    .state
+                                    .windows
+                                    .new_screenlock
+                                    .insert(id, (None, surface))
+                                    .unwrap();
+                            }
+                        }
                     }
 
                     // Let's handle all user events
@@ -195,16 +243,24 @@ where
                             resize_req.insert(object_id.clone());
                         }
                     }
-                    for object_id in resize_req.iter() {
-                        if let Some(window) = self.state.windows.get(object_id) {
+                    for window_id in resize_req.iter() {
+                        if let Some(window) = self.state.windows.get(window_id) {
                             app.resize_handle(
-                                window.get_surface_id(),
+                                window_id,
                                 logical_to_physical_rounded(
                                     window.size,
                                     window.scale_factor as f64,
                                 ),
                             );
-                            redraw_req.insert(object_id.clone());
+                            redraw_req.insert(window_id.clone());
+                        } else if let Some(screenlock) =
+                            self.state.windows.screenlocks.get(window_id)
+                        {
+                            app.resize_handle(
+                                window_id,
+                                logical_to_physical_rounded(screenlock.size.unwrap(), 1.0 as f64),
+                            );
+                            redraw_req.insert(window_id.clone());
                         }
                     }
                     // Let's handle all user changes to windows
@@ -259,13 +315,13 @@ where
                     }
                     for object_id in redraw_req {
                         if let Some(window) = self.state.windows.get_mut(&object_id) {
-                            // TODO: Чтобы делать нормальный refresh frame, нужно вызывать draw_handle, а не запрос на перерисовку
+                            // TODO: to make normal refresh frame, we need to call draw_handle (not redraw request)
                             window.refresh_frame();
                             app.draw_handle(window.core.clone(), &mut window.accesskit_adapter);
                         }
                     }
                     for id in close_req.iter() {
-                        self.state.windows.remove(id);
+                        self.state.windows.remove_window(id);
                         app.close_handle(id);
                     }
                 }
@@ -275,6 +331,16 @@ where
                 }
             }
 
+            // Remove locked state
+            if self
+                .state
+                .session_lock
+                .as_ref()
+                .is_some_and(|s| s.is_locked())
+                && SCREENLOCK.load(Ordering::Acquire)
+            {
+                self.state.unlock();
+            }
             // Let's handle all wayland state events and close an app, if we receive close request
             if self.state.windows.is_empty() || !LOOP_RUNNING.load(Ordering::Acquire) {
                 tracing::debug!("Closing an app...");
@@ -296,6 +362,7 @@ where
     UserEvent: 'static + Send,
 {
     fn create_window(&mut self, new_window: Arc<WindowCore>);
+    fn create_screenlock(&mut self, new_screenlock: Weak<WindowCore>, size: LogicalSize<u32>);
     fn draw_handle(&mut self, window: Arc<WindowCore>, adapter: &mut Adapter);
     fn keyboard_handle(&mut self, window_id: &WindowId, keyboard_event: KeyboardEvent);
     fn pointer_handle(&mut self, window_id: &WindowId, pointer_event: PointerEvent);

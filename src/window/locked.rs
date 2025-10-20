@@ -1,81 +1,79 @@
+use std::sync::{Arc, Weak};
+
 use accesskit_unix::Adapter;
+use cursor_icon::CursorIcon;
 use dpi::LogicalSize;
-use raw_window_handle::{
-    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
-    RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle,
-};
 use smithay_client_toolkit::{
-    reexports::client::{Proxy, protocol::wl_display::WlDisplay},
-    session_lock::SessionLockSurface,
+    reexports::calloop::channel::Sender, session_lock::SessionLockSurface,
 };
+use tracing::error;
 use wayland_backend::client::ObjectId;
 
-use crate::WindowId;
+use crate::{Events, WindowCore, WindowId};
 
-pub struct LockedSurface {
-    pub window_id: WindowId,
-    pub(crate) lock_surface: SessionLockSurface,
-    pub(crate) display: WlDisplay,
+pub struct ScreenLock {
+    pub core: Arc<WindowCore>,
+    pub(crate) _lock_surface: SessionLockSurface,
+    pub(crate) output_id: ObjectId,
     pub accesskit_adapter: Adapter,
     pub size: Option<LogicalSize<u32>>,
+    pub(crate) selected_cursor: CursorIcon,
+    /// Whether the cursor is visible.
+    pub(crate) cursor_visible: bool,
+    pub(crate) event_sender: Sender<Events>,
 }
 
-impl LockedSurface {
+impl ScreenLock {
     pub fn new(
-        window_id: WindowId,
-        lock_surface: SessionLockSurface,
-        display: WlDisplay,
+        core: Arc<WindowCore>,
+        _lock_surface: SessionLockSurface,
+        output_id: ObjectId,
         accesskit_adapter: Adapter,
+        event_sender: Sender<Events>,
     ) -> Self {
         Self {
-            window_id,
-            lock_surface,
-            display,
+            core,
+            _lock_surface,
+            output_id,
             accesskit_adapter,
             size: None,
+            selected_cursor: Default::default(),
+            cursor_visible: true,
+            event_sender,
         }
     }
 
     #[inline]
-    pub fn get_id(&self) -> ObjectId {
-        self.lock_surface.wl_surface().id()
+    pub fn set_cursor(&mut self, cursor: CursorIcon) {
+        self.selected_cursor = cursor;
     }
 
     #[inline]
-    pub(crate) fn raw_window_handle_rwh_06(&self) -> Result<RawWindowHandle, HandleError> {
-        Ok(WaylandWindowHandle::new({
-            let ptr = self.get_id().as_ptr();
-            std::ptr::NonNull::new(ptr as *mut _).expect("wl_surface will never be null")
-        })
-        .into())
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
     }
 
     #[inline]
-    pub(crate) fn raw_display_handle_rwh_06(&self) -> Result<RawDisplayHandle, HandleError> {
-        Ok(WaylandDisplayHandle::new({
-            let ptr = self.display.id().as_ptr();
-            std::ptr::NonNull::new(ptr as *mut _).expect("wl_proxy should never be null")
-        })
-        .into())
+    pub fn get_id(&self) -> WindowId {
+        self.core.get_id()
     }
-}
 
-impl HasWindowHandle for LockedSurface {
-    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let raw = self.raw_window_handle_rwh_06()?;
-
-        // SAFETY: The window handle will never be deallocated while the window is alive,
-        // and the main thread safety requirements are upheld internally by each platform.
-        Ok(unsafe { WindowHandle::borrow_raw(raw) })
+    #[inline]
+    pub fn get_output_id(&self) -> ObjectId {
+        self.output_id.clone()
     }
-}
 
-impl HasDisplayHandle for LockedSurface {
-    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        let raw = self.raw_display_handle_rwh_06()?;
+    #[inline]
+    pub fn get_core(&self) -> Weak<WindowCore> {
+        Arc::downgrade(&self.core)
+    }
 
-        // SAFETY: The window handle will never be deallocated while the window is alive,
-        // and the main thread safety requirements are upheld internally by each platform.
-        Ok(unsafe { DisplayHandle::borrow_raw(raw) })
+    pub fn redraw_request(&self) {
+        if let Err(err) = self
+            .event_sender
+            .send(Events::RedrawRequest(self.core.id.clone()))
+        {
+            error!("{err}");
+        }
     }
 }

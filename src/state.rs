@@ -42,12 +42,13 @@ use smithay_client_toolkit::{
     subcompositor::SubcompositorState,
 };
 use tracing::error;
+use wayland_backend::client::ObjectId;
 
 use crate::{
-    AccesskitEvents, AccesskitHandler, Events, WindowCore, ViewporterState, WaylandWindow,
-    WindowAttributes, WindowId, WindowsRegistry,
+    AccesskitEvents, AccesskitHandler, Events, ViewporterState, WaylandWindow, WindowAttributes,
+    WindowCore, WindowId, WindowsRegistry,
     seat::{PointerKind, SeatState},
-    window::locked::LockedSurface,
+    window::locked::ScreenLock,
 };
 
 pub struct WaylandState {
@@ -103,9 +104,8 @@ pub struct WaylandState {
     // The pool where images are allocated (used for window icons and custom cursors)
     // Пока непонятно, зачем мне это нужно. Возможно, xilem выделяет буфер самостоятельно как то
     // pub image_pool: SlotPool,
-    session_lock_state: SessionLockState,
-    session_lock: Option<SessionLock>,
-    lock_surfaces: Vec<LockedSurface>,
+    pub(crate) session_lock_state: SessionLockState,
+    pub(crate) session_lock: Option<SessionLock>,
 }
 
 impl WaylandState {
@@ -182,7 +182,6 @@ impl WaylandState {
                 events: VecDeque::new(),
                 session_lock_state: SessionLockState::new(&globals, &queue_handle),
                 session_lock: None,
-                lock_surfaces: Vec::new(),
                 queue_handle,
                 loop_handle: event_loop.handle(),
                 csd_fails: true,
@@ -192,27 +191,63 @@ impl WaylandState {
         )
     }
 
-    pub fn create_locked_surfaces(&mut self) {
-        if let Some(session_lock) = self.session_lock.as_ref() {
-            for output in self.output_state.outputs() {
-                let surface = self.compositor_state.create_surface(&self.queue_handle);
-                let accesskit =
-                    AccesskitHandler::new(surface.id().into(), self.accesskit_event_sender.clone());
-
-                let accesskit_adapter =
-                    Adapter::new(accesskit.clone(), accesskit.clone(), accesskit);
-
-                // It's important to keep the `SessionLockSurface` returned here around, as the
-                // surface will be destroyed when the `SessionLockSurface` is dropped.
-                let lock_surface =
-                    session_lock.create_lock_surface(surface, &output, &self.queue_handle);
-
-                // let locked_surface =
-                //     LockedSurface::new(lock_surface, self.conn.display(), accesskit_adapter);
-
-                // self.lock_surfaces.push(locked_surface);
-            }
+    pub fn lock(&mut self) {
+        self.session_lock = Some(
+            self.session_lock_state
+                .lock(&self.queue_handle)
+                .expect("ext-session-lock not supported"),
+        );
+        for output in self.output_state.outputs() {
+            self.create_locked_surface(output);
         }
+    }
+
+    pub fn unlock(&mut self) {
+        if let Some(session) = self.session_lock.take() {
+            session.unlock();
+            // Sync connection to make sure compostor receives destroy
+            self.conn.roundtrip().unwrap();
+            // TODO: should we destroy every screenlock wlsurface?
+            self.windows.screenlocks.clear();
+        }
+    }
+
+    pub fn create_locked_surface(&mut self, output: WlOutput) {
+        let surface = self.compositor_state.create_surface(&self.queue_handle);
+        let id: WindowId = surface.id().into();
+        let output_id = output.id();
+        let accesskit = AccesskitHandler::new(id.clone(), self.accesskit_event_sender.clone());
+
+        let accesskit_adapter = Adapter::new(accesskit.clone(), accesskit.clone(), accesskit);
+
+        // It's important to keep the `SessionLockSurface` returned here around, as the
+        // surface will be destroyed when the `SessionLockSurface` is dropped.
+        let lock_surface = self.session_lock.as_ref().unwrap().create_lock_surface(
+            surface,
+            &output,
+            &self.queue_handle,
+        );
+
+        let core = Arc::new(WindowCore::new(id.clone(), self.conn.display()));
+
+        // Add screenlock creation event without size. Size must be received from compositor and then
+        // we ask app to draw surface
+        self.windows
+            .new_screenlock
+            .insert(id.clone(), (None, Arc::downgrade(&core)));
+
+        let screenlock = ScreenLock::new(
+            core,
+            lock_surface,
+            output_id,
+            accesskit_adapter,
+            self.event_sender.clone(),
+        );
+        self.windows.insert_screenlock(id.clone(), screenlock);
+    }
+
+    pub fn remove_locked_surface(&mut self, output_id: ObjectId) {
+        self.windows.remove_screenlock_by_output_id(&output_id);
     }
 
     pub fn create_window(&mut self, new_window: WindowAttributes) {
@@ -261,7 +296,7 @@ impl WaylandState {
         let immutable = Arc::new(WindowCore::new(wl_id.clone().into(), self.conn.display()));
         self.windows.new_windows.push(immutable.clone());
 
-        self.windows.insert(
+        self.windows.insert_window(
             wl_id.into(),
             WaylandWindow::new(
                 immutable,
@@ -278,7 +313,7 @@ impl WaylandState {
 
     pub fn close_window(&mut self, id: &WindowId) -> WindowId {
         // Panic, if there is no windows to remove
-        let id = self.windows.remove(&id);
+        let id = self.windows.remove_window(&id);
         if self.windows.is_empty() {
             // Free event sources to close an app properly
             for token in self.event_source_token.drain(..) {
@@ -381,11 +416,24 @@ impl OutputHandler for WaylandState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {}
+    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+        if let Some(_) = self.session_lock {
+            self.create_locked_surface(output);
+        }
+    }
 
-    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {}
+    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
+        if let Some(_) = self.session_lock {
+            // Does output here has the same id, as in our self.lock_surfaces vec?
+        }
+    }
 
-    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
+    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+        if let Some(_) = self.session_lock {
+            let output_id = output.id();
+            // Destroy locked surfaces
+            self.remove_locked_surface(output_id);
+        }
     }
 }
 
@@ -504,11 +552,16 @@ impl WindowHandler for WaylandState {
 }
 
 impl SessionLockHandler for WaylandState {
-    fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _session_lock: SessionLock) {
+    fn locked(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session_lock: SessionLock) {
         todo!()
     }
 
-    fn finished(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _session_lock: SessionLock) {
+    fn finished(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _session_lock: SessionLock,
+    ) {
         todo!()
     }
 
@@ -516,11 +569,31 @@ impl SessionLockHandler for WaylandState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: SessionLockSurface,
-        _configure: SessionLockSurfaceConfigure,
+        surface: SessionLockSurface,
+        configure: SessionLockSurfaceConfigure,
         _serial: u32,
     ) {
-        todo!()
+        let id: WindowId = surface.wl_surface().id().into();
+
+        let (new_size, _) = match self.windows.screenlocks.get_mut(&id) {
+            Some(screenlock) => {
+                let size: LogicalSize<u32> = LogicalSize::from(configure.new_size);
+                screenlock.size = Some(size);
+                (size, Arc::downgrade(&screenlock.core))
+            }
+            None => return,
+        };
+
+        match self.windows.new_screenlock.get_mut(&id) {
+            Some((size, _)) => {
+                let _ = size.insert(new_size);
+            }
+            None => {
+                self.windows.resize_request.insert(id.clone());
+            }
+        }
+
+        // TODO: somehow we need to notify app about size changes in existing renders
     }
 }
 

@@ -24,6 +24,7 @@ impl KeyboardHandler for WaylandState {
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         let id = surface.id();
+        tracing::debug!("Keyboard enter {}", id);
         if self.windows.get_mut(&id.clone().into()).is_some() {
             if let Err(err) = self
                 .event_sender
@@ -44,6 +45,7 @@ impl KeyboardHandler for WaylandState {
         _serial: u32,
     ) {
         let id = surface.id();
+        tracing::debug!("Keyboard leave {}", id);
         if let Err(err) = self.event_sender.send(Events::Focus(id.into(), false)) {
             error!("{err}");
         }
