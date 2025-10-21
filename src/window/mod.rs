@@ -425,8 +425,6 @@ impl WaylandWindow {
     pub fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) -> bool {
         let pointer_data = pointer.data::<PointerData>().unwrap();
         let seat = pointer_data.seat();
-        // TODO: remove tracing
-        tracing::debug!("Frame action: {:?}", action);
         match action {
             FrameAction::Close => return true,
             FrameAction::Minimize => self.window.set_minimized(),

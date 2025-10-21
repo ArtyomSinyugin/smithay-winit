@@ -24,7 +24,6 @@ impl KeyboardHandler for WaylandState {
         _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
     ) {
         let id = surface.id();
-        tracing::debug!("Keyboard enter {}", id);
         if self.windows.get_mut(&id.clone().into()).is_some() {
             if let Err(err) = self
                 .event_sender
@@ -45,7 +44,6 @@ impl KeyboardHandler for WaylandState {
         _serial: u32,
     ) {
         let id = surface.id();
-        tracing::debug!("Keyboard leave {}", id);
         if let Err(err) = self.event_sender.send(Events::Focus(id.into(), false)) {
             error!("{err}");
         }
@@ -94,12 +92,38 @@ impl KeyboardHandler for WaylandState {
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
         _serial: u32,
-        _modifiers: WaylandModifiers,
-        raw_modifiers: RawModifiers,
+        WaylandModifiers {
+            ctrl,
+            alt,
+            shift,
+            caps_lock,
+            logo,
+            num_lock,
+        }: WaylandModifiers,
+        _raw_modifiers: RawModifiers,
         _layout: u32,
     ) {
-        let combined = raw_modifiers.depressed | raw_modifiers.latched | raw_modifiers.locked;
-        self.seat_state.modifiers = Modifiers::from_bits_truncate(combined);
+        let mut modifiers = Modifiers::empty();
+        if ctrl {
+            modifiers |= Modifiers::CONTROL;
+        }
+        if alt {
+            modifiers |= Modifiers::ALT;
+        }
+        if shift {
+            modifiers |= Modifiers::SHIFT;
+        }
+        if caps_lock {
+            modifiers |= Modifiers::CAPS_LOCK;
+        }
+        if logo {
+            modifiers |= Modifiers::META;
+        }
+        if num_lock {
+            modifiers |= Modifiers::NUM_LOCK;
+        }
+
+        self.seat_state.modifiers = modifiers;
     }
 }
 
