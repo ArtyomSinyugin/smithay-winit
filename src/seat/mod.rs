@@ -1,6 +1,7 @@
 use std::{collections::HashMap, rc::Rc};
 
 use cursor_icon::CursorIcon;
+use indexmap::IndexMap;
 use smithay_client_toolkit::{
     reexports::client::{
         Connection, Proxy, QueueHandle,
@@ -19,7 +20,7 @@ use ui_events::{
 };
 use wayland_backend::client::ObjectId;
 
-use crate::{Events, WaylandState, WindowId};
+use crate::{Events, WaylandState, WindowId, seat::touch::TouchState};
 
 pub mod keyboard;
 pub mod pointer;
@@ -106,6 +107,7 @@ impl PointerKind {
 pub struct PointerRegistry {
     by_seat: HashMap<WlSeatId, (WlPointerId, Rc<PointerKind>)>,
     by_pointer: HashMap<WlPointerId, (WlSeatId, PointerInfo)>,
+    touch_state: IndexMap<i32, TouchState>,
 }
 
 impl PointerRegistry {
@@ -147,6 +149,24 @@ impl PointerRegistry {
             .get(&pointer_id)
             .map(|(_, info)| info)
             .copied()
+    }
+
+    pub(crate) fn add_touch(&mut self, pointer_id: i32, state: TouchState) {
+        self.touch_state.insert(pointer_id, state);
+    }
+
+    pub fn frame_touch(&mut self, pointer_id: i32, state: bool) {
+        if let Some(touch) = self.touch_state.get_mut(&pointer_id) {
+            touch.frame_touch(state);
+        }
+    }
+
+    pub(crate) fn get_mut_touch(&mut self, pointer_id: i32) -> Option<&mut TouchState> {
+        self.touch_state.get_mut(&pointer_id)
+    }
+
+    pub(crate) fn remove_touch(&mut self, pointer_id: &i32) -> Option<TouchState> {
+        self.touch_state.swap_remove(pointer_id)
     }
 }
 
@@ -194,9 +214,9 @@ impl SeatHandler for WaylandState {
                 if let Ok(touch) = self.seat_state.seat.get_touch(qh, &seat) {
                     let touch_id = touch.id();
                     let info = PointerInfo {
-                        pointer_id: Some(PointerId::new(touch_id.protocol_id() as u64).unwrap()),
+                        pointer_id: None,
                         persistent_device_id: None,
-                        pointer_type: PointerType::Mouse,
+                        pointer_type: PointerType::Touch,
                     };
                     self.seat_state.pointers.add(
                         seat.id().into(),

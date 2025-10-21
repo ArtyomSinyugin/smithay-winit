@@ -6,6 +6,7 @@ use std::{
     num::NonZeroU32,
     rc::{Rc, Weak},
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use accesskit_unix::Adapter;
@@ -20,11 +21,10 @@ use sctk_adwaita::{AdwaitaFrame, FrameConfig};
 use smithay_client_toolkit::{
     compositor::Region,
     reexports::{
-        client::protocol::{wl_display::WlDisplay, wl_output::WlOutput, wl_pointer::WlPointer},
-        csd_frame::{FrameAction, ResizeEdge},
+        client::protocol::{wl_display::WlDisplay, wl_output::WlOutput, wl_seat::WlSeat},
+        csd_frame::{FrameAction, FrameClick, ResizeEdge},
         protocols::wp::viewporter::client::wp_viewport::WpViewport,
     },
-    seat::pointer::PointerData,
     shell::xdg::{
         XdgSurface,
         window::{DecorationMode, Window},
@@ -422,9 +422,25 @@ impl WaylandWindow {
             .retain(|p| !p.ptr_eq(&Rc::downgrade(&pointer)));
     }
 
-    pub fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) -> bool {
-        let pointer_data = pointer.data::<PointerData>().unwrap();
-        let seat = pointer_data.seat();
+    pub(crate) fn on_frame_action(
+        &mut self,
+        pressed: bool,
+        click: FrameClick,
+        seat: &WlSeat,
+        time: u32,
+        serial: u32,
+    ) -> bool {
+        if let Some(action) = self
+            .window_frame
+            .as_mut()
+            .and_then(|frame| frame.on_click(Duration::from_millis(time as u64), click, pressed))
+        {
+            return self.frame_action(seat, serial, action);
+        }
+        false
+    }
+
+    pub fn frame_action(&mut self, seat: &WlSeat, serial: u32, action: FrameAction) -> bool {
         match action {
             FrameAction::Close => return true,
             FrameAction::Minimize => self.window.set_minimized(),

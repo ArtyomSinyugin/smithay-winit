@@ -7,7 +7,9 @@ use smithay_client_toolkit::{
         client::{Connection, Proxy, QueueHandle, protocol::wl_pointer::WlPointer},
         csd_frame::{DecorationsFrame, FrameClick},
     },
-    seat::pointer::{PointerEvent as WlPointerEvent, PointerEventKind, PointerHandler},
+    seat::pointer::{
+        PointerData, PointerEvent as WlPointerEvent, PointerEventKind, PointerHandler,
+    },
 };
 use tracing::error;
 use ui_events::pointer::{PointerButton, PointerEvent, PointerState, PointerUpdate};
@@ -45,8 +47,9 @@ impl PointerHandler for WaylandState {
                     }
                     _ => None,
                 };
+                // TODO: add screenlock events
+                let position = LogicalPosition::<f64>::from(event.position);
                 if let Some(window) = self.windows.get_mut(&parent_id) {
-                    let position = LogicalPosition::<f64>::from(event.position);
                     let mut state = PointerState {
                         position: position.to_physical(window.scale_factor as f64),
                         modifiers: self.seat_state.modifiers,
@@ -93,18 +96,10 @@ impl PointerHandler for WaylandState {
                                     _ => continue,
                                 };
 
-                                if let Some(action) =
-                                    window.window_frame.as_mut().and_then(|frame| {
-                                        frame.on_click(
-                                            Duration::from_millis(time as u64),
-                                            click,
-                                            pressed,
-                                        )
-                                    })
-                                {
-                                    if window.frame_action(pointer, serial, action) {
-                                        self.windows.close_request.insert(parent_id);
-                                    }
+                                let pointer_data = pointer.data::<PointerData>().unwrap();
+                                let seat = pointer_data.seat();
+                                if window.on_frame_action(pressed, click, seat, time, serial) {
+                                    self.windows.close_request.insert(parent_id);
                                 }
                             }
                             PointerEventKind::Axis { .. } => {}
